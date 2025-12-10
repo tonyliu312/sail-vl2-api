@@ -1,13 +1,9 @@
 """
-SAIL-VL2-8B-Thinking 模型加载器
+SAIL-VL2-8B-Thinking CUDA 优化加载器 (RTX 4090)
 """
 import os
-# 设置离线模式环境变量（必须在导入transformers之前设置）
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
 import torch
-from transformers import AutoTokenizer, AutoModel, AutoProcessor, TextIteratorStreamer
+from transformers import AutoTokenizer, AutoModel, AutoProcessor, TextIteratorStreamer, BitsAndBytesConfig
 from PIL import Image
 import io
 import base64
@@ -16,101 +12,92 @@ import httpx
 import asyncio
 from threading import Thread
 
-# Monkey-patch 绕过 transformers 的网络检查
-try:
-    import transformers.tokenization_utils_base as tub
-    # 替换 _patch_mistral_regex 方法，跳过网络请求
-    original_patch_mistral_regex = tub.PreTrainedTokenizerBase._patch_mistral_regex
-    @classmethod
-    def _patched_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
-        # 直接返回 tokenizer，跳过 Mistral 检查
-        return tokenizer
-    tub.PreTrainedTokenizerBase._patch_mistral_regex = _patched_patch_mistral_regex
-except Exception:
-    pass
 
-
-class SAILVLModel:
-    def __init__(self, model_path: str = "BytedanceDouyinContent/SAIL-VL2-8B-Thinking", quantize: bool = False):
+class SAILVLModelCUDA:
+    def __init__(
+        self,
+        model_path: str = "BytedanceDouyinContent/SAIL-VL2-8B-Thinking",
+        quantization: str = "none",  # "none", "int8", "int4"
+        use_flash_attention: bool = True,
+    ):
         self.model_path = model_path
         self.model = None
         self.tokenizer = None
         self.processor = None
-        self.device = None
-        self.quantize = quantize  # 是否启用量化
-
-    def _get_device_and_dtype(self):
-        """检测最佳设备和数据类型"""
-        if torch.cuda.is_available():
-            return torch.device("cuda"), torch.bfloat16
-        elif torch.backends.mps.is_available():
-            # Apple Silicon MPS 加速
-            return torch.device("mps"), torch.float16  # MPS 不支持 bfloat16
-        else:
-            return torch.device("cpu"), torch.float32
+        self.quantization = quantization
+        self.use_flash_attention = use_flash_attention
 
     def load(self):
-        """加载模型、tokenizer和processor"""
+        """加载模型 - CUDA 优化版"""
         print(f"正在加载模型: {self.model_path}")
+        print(f"量化模式: {self.quantization}")
+        print(f"Flash Attention: {self.use_flash_attention}")
 
-        # 使用原始model_path (HuggingFace model ID)，这会加载已修复的模块
+        # 加载 tokenizer 和 processor
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             trust_remote_code=True,
-            local_files_only=True,
         )
         self.processor = AutoProcessor.from_pretrained(
             self.model_path,
             trust_remote_code=True,
-            local_files_only=True,
         )
 
-        self.device, self.dtype = self._get_device_and_dtype()
-        print(f"使用设备: {self.device}, 数据类型: {self.dtype}")
+        # 配置量化
+        quantization_config = None
+        torch_dtype = torch.bfloat16  # RTX 4090 原生支持 bfloat16
 
-        # SAILVLModel 目前不支持 SDPA，只能使用 eager
-        # 未来如果模型支持 SDPA，可以启用以获得 30-50% 的性能提升
-        attn_impl = "eager"
+        if self.quantization == "int8":
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+            )
+            print("使用 INT8 量化")
+
+        elif self.quantization == "int4":
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",  # NormalFloat4
+            )
+            print("使用 INT4 NF4 量化")
+
+        # 配置 Attention 实现
+        attn_impl = "flash_attention_2" if self.use_flash_attention else "sdpa"
+
+        # 检查 Flash Attention 是否可用
+        if self.use_flash_attention:
+            try:
+                import flash_attn
+                print(f"Flash Attention 版本: {flash_attn.__version__}")
+            except ImportError:
+                print("Flash Attention 未安装，回退到 SDPA")
+                attn_impl = "sdpa"
+
         print(f"Attention 实现: {attn_impl}")
 
+        # 加载模型
         self.model = AutoModel.from_pretrained(
             self.model_path,
             trust_remote_code=True,
-            torch_dtype=self.dtype,
+            torch_dtype=torch_dtype,
+            quantization_config=quantization_config,
             attn_implementation=attn_impl,
-            local_files_only=True,
-            low_cpu_mem_usage=True,  # 减少 CPU 内存使用
+            device_map="auto",  # 自动分配到 GPU
+            low_cpu_mem_usage=True,
         )
-
-        # 应用 quanto 量化（如果启用）
-        if self.quantize:
-            try:
-                from optimum.quanto import quantize, freeze, qint8
-                print("正在应用 quanto int8 量化...")
-                # 量化语言模型部分 (LLM)
-                quantize(self.model.language_model, weights=qint8)
-                freeze(self.model.language_model)
-                print("✓ LLM 量化完成 (int8)")
-            except Exception as e:
-                print(f"量化失败，将使用原始模型: {e}")
-
-        # 移动模型到设备
-        self.model = self.model.to(self.device)
 
         self.model.eval()
 
-        # 尝试使用 torch.compile 优化（实验性）
-        if self.device.type == "mps":
-            try:
-                # MPS 上使用 inductor 或 eager 后端
-                # 注意：torch.compile 在 MPS 上可能不稳定
-                # self.model = torch.compile(self.model, mode="reduce-overhead")
-                # print("✓ torch.compile 优化已启用")
-                pass
-            except Exception as e:
-                print(f"torch.compile 不可用: {e}")
+        # 打印显存使用
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"显存使用: {allocated:.2f}GB (已分配) / {reserved:.2f}GB (已预留)")
 
-        print(f"模型加载完成，设备: {self.device}")
+        print("模型加载完成")
 
     async def load_image_from_url(self, url: str) -> Image.Image:
         """从URL加载图片"""
@@ -121,17 +108,13 @@ class SAILVLModel:
 
     def load_image_from_base64(self, base64_str: str) -> Image.Image:
         """从base64加载图片"""
-        # 处理 data URI 格式
         if base64_str.startswith("data:"):
             base64_str = base64_str.split(",", 1)[1]
         image_data = base64.b64decode(base64_str)
         return Image.open(io.BytesIO(image_data)).convert("RGB")
 
     async def process_content(self, content: Union[str, List]) -> tuple[str, Optional[Image.Image]]:
-        """
-        处理OpenAI格式的content，返回文本和图片
-        content可以是字符串或者包含text/image_url的列表
-        """
+        """处理OpenAI格式的content"""
         if isinstance(content, str):
             return content, None
 
@@ -160,16 +143,7 @@ class SAILVLModel:
         top_p: float = 0.9,
         enable_thinking: bool = True,
     ) -> str:
-        """
-        生成响应
-
-        Args:
-            messages: OpenAI格式的消息列表
-            max_tokens: 最大生成token数
-            temperature: 温度参数
-            top_p: top_p采样参数
-            enable_thinking: 是否启用思考模式
-        """
+        """生成响应"""
         if self.model is None:
             raise RuntimeError("模型未加载，请先调用 load() 方法")
 
@@ -190,7 +164,6 @@ class SAILVLModel:
             if msg_image is not None:
                 image = msg_image
 
-            # 在最后一条用户消息添加思考提示
             if role == "user" and msg == messages[-1] and enable_thinking:
                 text = text + cot_prompt
 
@@ -215,37 +188,28 @@ class SAILVLModel:
             tokenize=False
         )
 
-        # 处理输入 - 使用实例的设备和数据类型
+        # 处理输入
         inputs = self.processor(
             images=image,
             text=text,
             return_tensors="pt",
             padding=True,
             truncation=True
-        )
+        ).to("cuda")
 
-        # 移动到正确的设备并转换数据类型
-        inputs = inputs.to(self.device)
-        if self.dtype != torch.float32:
-            # 仅对浮点张量转换数据类型
-            for key in inputs:
-                val = inputs[key]
-                if isinstance(val, torch.Tensor) and val.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                    inputs[key] = val.to(self.dtype)
-
-        # 生成配置 - 添加推理优化参数
-        # 注意：use_cache 由模型内部处理，不需要外部传递
+        # 生成配置
         gen_kwargs = {
             "max_new_tokens": max_tokens,
             "do_sample": temperature > 0,
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            "use_cache": True,  # CUDA 上启用 KV Cache
         }
 
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["top_p"] = top_p
 
-        # 生成响应 - 使用 inference_mode 比 no_grad 更快
+        # 生成响应
         with torch.inference_mode():
             generated_ids = self.model.generate(**inputs, **gen_kwargs)
 
@@ -256,7 +220,6 @@ class SAILVLModel:
         if '<|im_end|>' in response:
             response = response.split('<|im_end|>')[0].strip()
 
-        # 提取助手回复部分
         if '<|im_start|>assistant' in response:
             response = response.split('<|im_start|>assistant')[-1].strip()
 
@@ -266,27 +229,22 @@ class SAILVLModel:
 
         if '<think>' in response:
             import re
-            # 提取思考内容
             think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
             if think_match:
                 thinking_content = think_match.group(1).strip()
-                # 移除思考部分，保留最终答案
                 final_content = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
             else:
-                # 思考标签未闭合（被截断），提取思考后的内容
                 parts = response.split('<think>')
                 if len(parts) > 1:
                     thinking_content = parts[1].strip()
-                    final_content = ""  # 思考被截断，没有最终答案
+                    final_content = ""
 
-        # 如果启用思考模式且有思考内容，返回带思考的格式
         if enable_thinking and thinking_content:
             if final_content:
                 return f"<think>\n{thinking_content}\n</think>\n\n{final_content}"
             else:
                 return f"<think>\n{thinking_content}\n</think>"
 
-        # 如果没有最终内容但有思考内容，返回思考内容作为响应
         if not final_content and thinking_content:
             return thinking_content
 
@@ -300,16 +258,14 @@ class SAILVLModel:
         top_p: float = 0.9,
         enable_thinking: bool = False,
     ) -> AsyncGenerator[str, None]:
-        """流式生成响应 - 真正的异步流式输出"""
+        """流式生成响应"""
         if self.model is None:
             raise RuntimeError("模型未加载，请先调用 load() 方法")
 
-        # 思考模式提示词
         cot_prompt = ""
         if enable_thinking:
             cot_prompt = r" You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \boxed{}."
 
-        # 转换消息格式
         processed_messages = []
         image = None
 
@@ -321,7 +277,6 @@ class SAILVLModel:
             if msg_image is not None:
                 image = msg_image
 
-            # 在最后一条用户消息添加思考提示
             if role == "user" and msg == messages[-1] and enable_thinking:
                 text = text + cot_prompt
 
@@ -339,52 +294,39 @@ class SAILVLModel:
                     "content": [{"type": "text", "text": text}]
                 })
 
-        # 应用聊天模板
         text = self.processor.apply_chat_template(
             processed_messages,
             add_generation_prompt=True,
             tokenize=False
         )
 
-        # 处理输入 - 使用实例的设备和数据类型
         inputs = self.processor(
             images=image,
             text=text,
             return_tensors="pt",
             padding=True,
             truncation=True
-        )
+        ).to("cuda")
 
-        # 移动到正确的设备并转换数据类型
-        inputs = inputs.to(self.device)
-        if self.dtype != torch.float32:
-            for key in inputs:
-                val = inputs[key]
-                if isinstance(val, torch.Tensor) and val.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                    inputs[key] = val.to(self.dtype)
-
-        # 创建流式生成器
         streamer = TextIteratorStreamer(
             self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
-            timeout=60.0  # 增加超时时间
+            timeout=60.0
         )
 
-        # 生成配置 - 添加推理优化参数
-        # 注意：use_cache 由模型内部处理，不需要外部传递
         gen_kwargs = {
             "max_new_tokens": max_tokens,
             "do_sample": temperature > 0,
             "streamer": streamer,
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            "use_cache": True,
         }
 
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["top_p"] = top_p
 
-        # 在后台线程中运行生成 - 使用 inference_mode 比 no_grad 更快
         def generate_in_thread():
             with torch.inference_mode():
                 self.model.generate(**inputs, **gen_kwargs)
@@ -392,13 +334,11 @@ class SAILVLModel:
         thread = Thread(target=generate_in_thread)
         thread.start()
 
-        # 使用队列在线程间安全地传递数据
         import queue
         token_queue = queue.Queue()
-        SENTINEL = object()  # 用于标记迭代结束
+        SENTINEL = object()
 
         def stream_to_queue():
-            """从 streamer 读取数据并放入队列"""
             try:
                 for text in streamer:
                     token_queue.put(text)
@@ -407,16 +347,13 @@ class SAILVLModel:
             finally:
                 token_queue.put(SENTINEL)
 
-        # 启动队列填充线程
         queue_thread = Thread(target=stream_to_queue)
         queue_thread.start()
 
-        # 从队列中异步获取数据
         loop = asyncio.get_event_loop()
 
         while True:
             try:
-                # 在线程池中运行阻塞的队列获取操作
                 item = await loop.run_in_executor(
                     None,
                     lambda: token_queue.get(timeout=120.0)
@@ -430,39 +367,44 @@ class SAILVLModel:
                     yield item
 
             except queue.Empty:
-                # 队列超时，检查线程是否还在运行
                 if not thread.is_alive() and not queue_thread.is_alive():
                     break
                 continue
-            except Exception as e:
-                # 其他错误
+            except Exception:
                 break
 
-        # 等待线程结束
         queue_thread.join(timeout=5.0)
         thread.join(timeout=5.0)
 
 
 # 全局模型实例
-_model_instance: Optional[SAILVLModel] = None
+_model_instance: Optional[SAILVLModelCUDA] = None
 
 
-def get_model() -> SAILVLModel:
-    """获取全局模型实例"""
+def get_model() -> SAILVLModelCUDA:
     global _model_instance
     if _model_instance is None:
-        _model_instance = SAILVLModel()
+        _model_instance = SAILVLModelCUDA()
     return _model_instance
 
 
-def init_model(model_path: str = "BytedanceDouyinContent/SAIL-VL2-8B-Thinking", quantize: bool = False):
+def init_model(
+    model_path: str = "BytedanceDouyinContent/SAIL-VL2-8B-Thinking",
+    quantization: str = "none",
+    use_flash_attention: bool = True,
+):
     """初始化全局模型实例
 
     Args:
-        model_path: 模型路径或 HuggingFace model ID
-        quantize: 是否启用 int8 量化（减少内存使用，可能提升速度）
+        model_path: 模型路径
+        quantization: 量化模式 - "none", "int8", "int4"
+        use_flash_attention: 是否使用 Flash Attention 2
     """
     global _model_instance
-    _model_instance = SAILVLModel(model_path, quantize=quantize)
+    _model_instance = SAILVLModelCUDA(
+        model_path,
+        quantization=quantization,
+        use_flash_attention=use_flash_attention,
+    )
     _model_instance.load()
     return _model_instance

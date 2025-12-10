@@ -1,0 +1,28 @@
+# SAIL-VL2-8B-Thinking CUDA 依赖 (RTX 4090)
+# 安装: pip install -r requirements_cuda.txt
+
+# PyTorch with CUDA (需要单独安装)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 核心依赖
+transformers>=4.40.0
+accelerate>=0.27.0
+safetensors>=0.4.0
+
+# 量化支持
+bitsandbytes>=0.42.0
+
+# API 服务
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+httpx>=0.26.0
+
+# 图像处理
+pillow>=10.0.0
+
+# Tokenizer
+sentencepiece
+tiktoken
+
+# 可选: Flash Attention 2 (需要单独安装)
+# pip install flash-attn --no-build-isolation
